@@ -156,58 +156,68 @@ def fetch_twse() -> None:
 
 # ------------------------------------------------------------------ FRED
 def fred_nasdaq() -> bytes:
-    """NASDAQCOM daily closes. The one-shot fredgraph endpoint tar-pits CI
-    runners, so try the static download endpoint first, then fredgraph in
-    four 15-year windows whose smaller responses stream before the timeout."""
-    try:
-        content = fetch(
-            "https://fred.stlouisfed.org/series/NASDAQCOM/downloaddata/NASDAQCOM.csv",
-            tries=2, base_wait=8.0, timeout=120,
-        )
+    """NASDAQCOM daily closes. FRED tar-pits CI runner IPs (reads stall
+    even for tiny ranges), so this is a single quick probe in case this
+    particular runner's egress IP is not affected."""
+    for url in (
+        "https://fred.stlouisfed.org/series/NASDAQCOM/downloaddata/NASDAQCOM.csv",
+        "https://fred.stlouisfed.org/graph/fredgraph.csv?id=NASDAQCOM",
+    ):
+        try:
+            content = fetch(url, tries=1, timeout=45)
+        except Exception as exc:  # noqa: BLE001
+            log(f"  FRED probe failed ({exc})")
+            continue
         first = content[:80].decode("utf-8", "replace").split("\n")[0].lower()
         if first.startswith(("date", "observation_date")):
             return content
-        log("  FRED downloaddata returned unexpected payload, falling back")
-    except Exception as exc:  # noqa: BLE001
-        log(f"  FRED downloaddata failed ({exc}), trying chunked fredgraph")
+        log("  FRED probe returned unexpected payload")
+    raise RuntimeError("FRED unreachable from this runner")
 
-    today = datetime.date.today().isoformat()
-    windows = [
-        ("1971-01-01", "1985-12-31"),
-        ("1986-01-01", "2000-12-31"),
-        ("2001-01-01", "2015-12-31"),
-        ("2016-01-01", today),
+
+# -------------------------------------------------------------- Wayback
+def wayback_nasdaq() -> tuple[str, bytes, str]:
+    """Hunt the Internet Archive for a byte-exact snapshot of a full
+    Nasdaq Composite daily CSV (finance sites block CI runner IPs, but
+    archive.org does not). Returns (save_name, content, snapshot_ts)."""
+    candidates = [
+        # (original URL as archived, save name, minimum expected rows)
+        ("stooq.com/q/d/l/?s=^ndq&i=d", "nasdaq_stooq_wayback.csv", 10000),
+        ("https://stooq.com/q/d/l/?s=%5Endq&i=d", "nasdaq_stooq_wayback.csv", 10000),
+        ("fred.stlouisfed.org/graph/fredgraph.csv?id=NASDAQCOM",
+         "nasdaq_fred_wayback.csv", 10000),
     ]
-    header = None
-    rows: list[str] = []
-    for start, end in windows:
-        url = (
-            "https://fred.stlouisfed.org/graph/fredgraph.csv"
-            f"?id=NASDAQCOM&cosd={start}&coed={end}"
+    for original, name, min_rows in candidates:
+        cdx = (
+            "https://web.archive.org/cdx/search/cdx?url="
+            + urllib.parse.quote(original, safe="")
+            + "&output=json&filter=statuscode:200&collapse=digest&limit=-12"
         )
-        lines = fetch(url, tries=3, base_wait=10.0, timeout=150).decode(
-            "utf-8", "replace").strip().splitlines()
-        if header is None:
-            header = lines[0]
-        rows.extend(lines[1:])
-        log(f"  FRED chunk {start}..{end}: {len(lines) - 1} rows")
-        time.sleep(2)
-    return (header + "\n" + "\n".join(rows) + "\n").encode()
-
-
-# ------------------------------------------------------------------- WSJ
-def wsj_nasdaq() -> bytes:
-    """Nasdaq Composite daily OHLC from WSJ's historical-prices download."""
-    end = datetime.date.today().strftime("%m/%d/%Y")
-    url = (
-        "https://www.wsj.com/market-data/quotes/index/US/COMP/"
-        f"historical-prices/download?MOD=mw_quote&startDate=02/05/1971&endDate={end}"
-    )
-    content = fetch(url, tries=2, base_wait=10.0, timeout=120)
-    first = content[:200].decode("utf-8", "replace").split("\n")[0]
-    if "Date" not in first:
-        raise RuntimeError(f"unexpected WSJ payload: {first[:80]!r}")
-    return content
+        try:
+            rows = json.loads(fetch(cdx, tries=3, base_wait=8.0, timeout=60))
+        except Exception as exc:  # noqa: BLE001
+            log(f"  wayback cdx failed for {original}: {exc}")
+            continue
+        if not isinstance(rows, list) or len(rows) < 2:
+            log(f"  wayback: no captures for {original}")
+            continue
+        for cap in reversed(rows[1:]):  # newest capture first
+            ts, archived_url = cap[1], cap[2]
+            raw_url = f"https://web.archive.org/web/{ts}id_/{archived_url}"
+            try:
+                content = fetch(raw_url, tries=2, base_wait=8.0, timeout=120)
+            except Exception as exc:  # noqa: BLE001
+                log(f"  wayback fetch @{ts} failed: {exc}")
+                continue
+            text = content.decode("utf-8", "replace")
+            first = text.split("\n", 1)[0].strip().lower()
+            n_lines = text.count("\n")
+            if first.startswith(("date", "observation_date")) and n_lines >= min_rows:
+                log(f"  wayback hit: {archived_url} @{ts} ({n_lines} lines)")
+                return name, content, ts
+            log(f"  wayback capture @{ts} unusable "
+                f"(header {first[:40]!r}, {n_lines} lines)")
+    raise RuntimeError("no usable wayback snapshot for Nasdaq")
 
 
 # ----------------------------------------------------------------- Yahoo
@@ -247,20 +257,9 @@ def main() -> None:
     failures: list[str] = []
 
     def secondary_sources() -> None:
-        if not is_fresh("nasdaq_fred.csv"):
-            try:
-                save("nasdaq_fred.csv", fred_nasdaq())
-            except Exception as exc:  # noqa: BLE001
-                failures.append(f"FRED NASDAQCOM: {exc}")
-
-        if not is_fresh("nasdaq_wsj.csv"):
-            try:
-                save("nasdaq_wsj.csv", wsj_nasdaq())
-            except Exception as exc:  # noqa: BLE001
-                log(f"WARNING optional source WSJ failed: {exc}")
-
+        # Yahoo first: it fails fast (immediate 429) when blocked.
         try:  # warm up the cookie jar; yahoo rate-limits bare API hits harder
-            fetch("https://finance.yahoo.com/", tries=1)
+            fetch("https://finance.yahoo.com/", tries=1, timeout=30)
         except Exception:  # noqa: BLE001
             pass
         for symbol, name in [("^TWII", "taiex_yahoo.csv"), ("^IXIC", "nasdaq_yahoo.csv")]:
@@ -270,6 +269,34 @@ def main() -> None:
                 save(name, yahoo_daily_csv(symbol))
             except Exception as exc:  # noqa: BLE001
                 log(f"WARNING optional source Yahoo {symbol} failed: {exc}")
+
+        have_nasdaq = (OUT / "nasdaq_yahoo.csv").exists()
+
+        if not have_nasdaq and not is_fresh("nasdaq_fred.csv"):
+            try:
+                save("nasdaq_fred.csv", fred_nasdaq())
+                have_nasdaq = True
+            except Exception as exc:  # noqa: BLE001
+                log(f"WARNING FRED direct failed: {exc}")
+        have_nasdaq = have_nasdaq or (OUT / "nasdaq_fred.csv").exists()
+
+        if not have_nasdaq:
+            for name in ("nasdaq_stooq_wayback.csv", "nasdaq_fred_wayback.csv"):
+                if (OUT / name).exists():
+                    have_nasdaq = True
+            if not have_nasdaq:
+                try:
+                    name, content, ts = wayback_nasdaq()
+                    save(name, content)
+                    (OUT / "nasdaq_wayback_provenance.txt").write_text(
+                        f"{name} downloaded from Internet Archive snapshot {ts}\n"
+                    )
+                    have_nasdaq = True
+                except Exception as exc:  # noqa: BLE001
+                    log(f"WARNING wayback hunt failed: {exc}")
+
+        if not have_nasdaq:
+            failures.append("no Nasdaq source succeeded (Yahoo, FRED, Wayback)")
 
     worker = threading.Thread(target=secondary_sources)
     worker.start()
