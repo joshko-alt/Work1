@@ -1,0 +1,35 @@
+name: Fetch market data
+
+on:
+  push:
+    branches:
+      - claude/taiwan-nasdaq-backtest-bpor5s
+    paths:
+      - .github/workflows/fetch-market-data.yml
+      - scripts/fetch_market_data.py
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fetch-market-data
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch daily index history
+        run: python3 scripts/fetch_market_data.py
+
+      - name: Commit data back to the branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          git commit -m "Add TAIEX / Nasdaq daily history fetched from Stooq, Yahoo, FRED" || echo "nothing to commit"
+          git push
