@@ -56,29 +56,74 @@ def load_fred(path: pathlib.Path) -> pd.Series:
     return df.dropna().set_index("Date")["Close"]
 
 
-# Nasdaq file candidates in preference order: real intraday lows first,
-# then close-only series; wayback files are byte-exact Internet Archive
-# snapshots fetched when live sources block CI egress IPs.
+# Nasdaq file candidates: live fetches first, then byte-exact Internet
+# Archive snapshots collected when live sources block CI egress IPs.
 NASDAQ_SOURCES = [
     ("nasdaq_yahoo.csv", "Yahoo Finance ^IXIC（日開高低收）", "ohlc"),
+    ("nasdaq_yahoo_wayback.csv",
+     "Yahoo Finance ^IXIC 日開高低收（Internet Archive 快照）", "ohlc"),
     ("nasdaq_stooq_wayback.csv",
-     "Stooq ^ndq 日開高低收（Internet Archive 網頁快照）", "ohlc"),
+     "Stooq ^ndq 日開高低收（Internet Archive 快照）", "ohlc"),
+    ("nasdaq_stooq_wayback_tail.csv",
+     "Stooq ^ndq 日開高低收（Internet Archive 較新快照）", "ohlc"),
     ("nasdaq_fred.csv", "FRED NASDAQCOM（日收盤）", "fred"),
     ("nasdaq_fred_wayback.csv",
-     "FRED NASDAQCOM（Internet Archive 網頁快照，日收盤）", "fred"),
+     "FRED NASDAQCOM（Internet Archive 快照，日收盤）", "fred"),
 ]
 
 
+def _load_nasdaq_file(name: str, kind: str) -> pd.DataFrame:
+    if kind == "ohlc":
+        return load_ohlc(DATA / name)
+    return load_fred(DATA / name).to_frame("Close")
+
+
+def splice(base: pd.DataFrame, tail: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    """Extend base with tail rows after base's end; the overlap must agree.
+    Only columns common to both survive, so a close-only tail deliberately
+    downgrades the whole series to close-only (consistent touch rule)."""
+    overlap = base.index.intersection(tail.index)
+    if len(overlap) < 20:
+        raise ValueError(f"insufficient overlap ({len(overlap)} days)")
+    diff = (base.loc[overlap, "Close"] / tail.loc[overlap, "Close"] - 1).abs()
+    if diff.median() > 0.005:
+        raise ValueError(f"overlap disagrees (median {diff.median():.2%})")
+    cols = [c for c in base.columns if c in tail.columns]
+    comp = pd.concat([base[cols], tail.loc[tail.index > base.index.max(), cols]])
+    return comp, diff
+
+
 def load_nasdaq() -> tuple[pd.DataFrame, str]:
-    """Return (daily frame, source description) from the best file present."""
+    """Best single Nasdaq series, or a validated splice when no single
+    file covers 1971->present. Returns (daily frame, source description)."""
+    available = []
     for name, desc, kind in NASDAQ_SOURCES:
-        path = DATA / name
-        if not path.exists():
+        if (DATA / name).exists():
+            df = _load_nasdaq_file(name, kind)
+            available.append((df, desc, kind))
+    if not available:
+        raise FileNotFoundError("no Nasdaq data file found under data/")
+
+    latest_end = max(df.index.max() for df, _, _ in available)
+    # A single file that starts by 1972 and reaches the latest end wins.
+    for df, desc, kind in available:
+        if df.index.min().year <= 1972 and df.index.max() >= latest_end - pd.Timedelta(days=7):
+            return df, desc
+
+    # Otherwise splice: longest history as base (prefer OHLC), then keep
+    # extending with whichever remaining series reaches furthest.
+    available.sort(key=lambda t: (t[0].index.min(), t[2] != "ohlc"))
+    base, base_desc, _ = available[0]
+    desc = base_desc + f"（至 {base.index.max().date()}）"
+    for df, d_desc, _ in sorted(available[1:], key=lambda t: t[0].index.max()):
+        if df.index.max() <= base.index.max():
             continue
-        if kind == "ohlc":
-            return load_ohlc(path), desc
-        return load_fred(path).to_frame("Close"), desc
-    raise FileNotFoundError("no Nasdaq data file found under data/")
+        switch = base.index.max().date()
+        base, diff = splice(base, df)
+        print(f"[splice] + {d_desc} after {switch}: "
+              f"overlap median rel diff {diff.median():.2e}")
+        desc += f"，{switch} 之後接 {d_desc}"
+    return base, desc
 
 
 def validate(name: str, df: pd.DataFrame) -> None:
