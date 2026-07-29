@@ -56,6 +56,31 @@ def load_fred(path: pathlib.Path) -> pd.Series:
     return df.dropna().set_index("Date")["Close"]
 
 
+# Nasdaq file candidates in preference order: real intraday lows first,
+# then close-only series; wayback files are byte-exact Internet Archive
+# snapshots fetched when live sources block CI egress IPs.
+NASDAQ_SOURCES = [
+    ("nasdaq_yahoo.csv", "Yahoo Finance ^IXIC（日開高低收）", "ohlc"),
+    ("nasdaq_stooq_wayback.csv",
+     "Stooq ^ndq 日開高低收（Internet Archive 網頁快照）", "ohlc"),
+    ("nasdaq_fred.csv", "FRED NASDAQCOM（日收盤）", "fred"),
+    ("nasdaq_fred_wayback.csv",
+     "FRED NASDAQCOM（Internet Archive 網頁快照，日收盤）", "fred"),
+]
+
+
+def load_nasdaq() -> tuple[pd.DataFrame, str]:
+    """Return (daily frame, source description) from the best file present."""
+    for name, desc, kind in NASDAQ_SOURCES:
+        path = DATA / name
+        if not path.exists():
+            continue
+        if kind == "ohlc":
+            return load_ohlc(path), desc
+        return load_fred(path).to_frame("Close"), desc
+    raise FileNotFoundError("no Nasdaq data file found under data/")
+
+
 def validate(name: str, df: pd.DataFrame) -> None:
     ret = df["Close"].pct_change().abs()
     big = ret[ret > 0.16]
@@ -164,18 +189,19 @@ def main() -> None:
         validate("TAIEX/yahoo", taiex_y)
         cross_check("TAIEX twse vs yahoo", taiex["Close"], taiex_y["Close"])
 
-    # Nasdaq: Yahoo OHLC preferred (real intraday lows); FRED close-only
-    # is the cross-check, and the fallback primary if Yahoo failed in CI.
-    nasdaq_f = load_fred(DATA / "nasdaq_fred.csv")
-    if (DATA / "nasdaq_yahoo.csv").exists():
-        nasdaq = load_ohlc(DATA / "nasdaq_yahoo.csv")
-        validate("NASDAQ/yahoo", nasdaq)
-        cross_check("NASDAQ yahoo vs FRED", nasdaq["Close"], nasdaq_f)
-    else:
-        print("NASDAQ falling back to FRED close-only series "
-              "(MA touches will use Close, not intraday Low)")
-        nasdaq = nasdaq_f.to_frame("Close")
-        validate("NASDAQ/fred", nasdaq)
+    # Nasdaq: best available source (see NASDAQ_SOURCES preference order),
+    # cross-checked against any other Nasdaq series that is also present.
+    nasdaq, nasdaq_src = load_nasdaq()
+    print(f"NASDAQ source: {nasdaq_src}")
+    validate("NASDAQ", nasdaq)
+    if "Low" not in nasdaq.columns:
+        print("NASDAQ series is close-only: MA touches use Close, not intraday Low")
+    for name, desc, kind in NASDAQ_SOURCES:
+        if desc == nasdaq_src or not (DATA / name).exists():
+            continue
+        other = (load_ohlc(DATA / name)["Close"] if kind == "ohlc"
+                 else load_fred(DATA / name))
+        cross_check(f"NASDAQ vs {name}", nasdaq["Close"], other)
 
     all_results = {}
     for name, df in [("台灣加權指數 TAIEX", taiex), ("那斯達克綜合指數 IXIC", nasdaq)]:
