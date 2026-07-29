@@ -49,11 +49,13 @@ def log(*args) -> None:
         print(*args, flush=True)
 
 
-def fetch(url: str, tries: int = 3, base_wait: float = 6.0, timeout: int = 45) -> bytes:
+def fetch(url: str, tries: int = 3, base_wait: float = 6.0, timeout: int = 45,
+          extra_headers: dict | None = None) -> bytes:
     last = None
+    headers = {**HEADERS, **(extra_headers or {})}
     for i in range(tries):
         try:
-            req = urllib.request.Request(url, headers=HEADERS)
+            req = urllib.request.Request(url, headers=headers)
             with _opener.open(req, timeout=timeout) as resp:
                 return resp.read()
         except Exception as exc:  # noqa: BLE001 - retry on any transport error
@@ -176,48 +178,99 @@ def fred_nasdaq() -> bytes:
 
 
 # -------------------------------------------------------------- Wayback
-def wayback_nasdaq() -> tuple[str, bytes, str]:
-    """Hunt the Internet Archive for a byte-exact snapshot of a full
-    Nasdaq Composite daily CSV (finance sites block CI runner IPs, but
-    archive.org does not). Returns (save_name, content, snapshot_ts)."""
-    candidates = [
-        # (original URL as archived, save name, minimum expected rows)
-        ("stooq.com/q/d/l/?s=^ndq&i=d", "nasdaq_stooq_wayback.csv", 10000),
-        ("https://stooq.com/q/d/l/?s=%5Endq&i=d", "nasdaq_stooq_wayback.csv", 10000),
-        ("fred.stlouisfed.org/graph/fredgraph.csv?id=NASDAQCOM",
-         "nasdaq_fred_wayback.csv", 10000),
+def cdx_captures(query: str) -> list[list[str]]:
+    """Query the Wayback CDX API; rows are oldest->newest capture tuples."""
+    url = (
+        "https://web.archive.org/cdx/search/cdx?" + query
+        + "&output=json&filter=statuscode:200&collapse=digest"
+    )
+    try:
+        rows = json.loads(fetch(url, tries=3, base_wait=8.0, timeout=60))
+    except Exception as exc:  # noqa: BLE001
+        log(f"  cdx query failed ({exc})")
+        return []
+    return rows[1:] if isinstance(rows, list) and len(rows) > 1 else []
+
+
+def csv_span(text: str):
+    """(first_date, last_date, n_rows) of a Date-first CSV, else None."""
+    lines = [ln for ln in text.strip().splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None
+    try:
+        d0 = datetime.date.fromisoformat(lines[1].split(",")[0].strip())
+        d1 = datetime.date.fromisoformat(lines[-1].split(",")[0].strip())
+    except ValueError:
+        return None
+    return d0, d1, len(lines) - 1
+
+
+def wayback_hunt_nasdaq_tail() -> None:
+    """The committed Stooq snapshot ends 2015-03-20; hunt newer captures of
+    full-history Nasdaq CSVs to cover 2015->present. Each hunt saves the
+    newest capture that starts before 2015-03 (so series can be spliced
+    with overlap validation) and ends after 2016."""
+    quote = lambda s: urllib.parse.quote(s, safe="")  # noqa: E731
+    hunts = [
+        ("url=" + quote("fred.stlouisfed.org/graph/fredgraph.csv?id=NASDAQCOM")
+         + "&limit=-25", "nasdaq_fred_wayback.csv"),
+        ("url=" + quote("fred.stlouisfed.org/graph/fredgraph.csv")
+         + "&matchType=prefix&filter=original:.*NASDAQCOM.*&limit=-50",
+         "nasdaq_fred_wayback.csv"),
+        ("url=" + quote("query1.finance.yahoo.com/v7/finance/download/^IXIC")
+         + "&matchType=prefix&limit=-50", "nasdaq_yahoo_wayback.csv"),
+        ("url=" + quote("query2.finance.yahoo.com/v7/finance/download/^IXIC")
+         + "&matchType=prefix&limit=-50", "nasdaq_yahoo_wayback.csv"),
+        ("url=" + quote("stooq.com/q/d/l/")
+         + "&matchType=prefix&filter=original:.*ndq.*&limit=-50",
+         "nasdaq_stooq_wayback_tail.csv"),
     ]
-    for original, name, min_rows in candidates:
-        cdx = (
-            "https://web.archive.org/cdx/search/cdx?url="
-            + urllib.parse.quote(original, safe="")
-            + "&output=json&filter=statuscode:200&collapse=digest&limit=-12"
-        )
-        try:
-            rows = json.loads(fetch(cdx, tries=3, base_wait=8.0, timeout=60))
-        except Exception as exc:  # noqa: BLE001
-            log(f"  wayback cdx failed for {original}: {exc}")
+    for query, name in hunts:
+        if (OUT / name).exists():
             continue
-        if not isinstance(rows, list) or len(rows) < 2:
-            log(f"  wayback: no captures for {original}")
-            continue
-        for cap in reversed(rows[1:]):  # newest capture first
-            ts, archived_url = cap[1], cap[2]
-            raw_url = f"https://web.archive.org/web/{ts}id_/{archived_url}"
+        for cap in reversed(cdx_captures(query)):  # newest capture first
+            ts, original = cap[1], cap[2]
+            if int(ts[:4]) < 2016:
+                break  # older captures cannot extend the tail
             try:
-                content = fetch(raw_url, tries=2, base_wait=8.0, timeout=120)
+                content = fetch(f"https://web.archive.org/web/{ts}id_/{original}",
+                                tries=2, base_wait=6.0, timeout=120)
             except Exception as exc:  # noqa: BLE001
                 log(f"  wayback fetch @{ts} failed: {exc}")
                 continue
-            text = content.decode("utf-8", "replace")
-            first = text.split("\n", 1)[0].strip().lower()
-            n_lines = text.count("\n")
-            if first.startswith(("date", "observation_date")) and n_lines >= min_rows:
-                log(f"  wayback hit: {archived_url} @{ts} ({n_lines} lines)")
-                return name, content, ts
-            log(f"  wayback capture @{ts} unusable "
-                f"(header {first[:40]!r}, {n_lines} lines)")
-    raise RuntimeError("no usable wayback snapshot for Nasdaq")
+            span = csv_span(content.decode("utf-8", "replace"))
+            if not span:
+                continue
+            d0, d1, n = span
+            if d0 <= datetime.date(2015, 3, 1) and d1 >= datetime.date(2016, 1, 1) and n >= 5000:
+                save(name, content)
+                with (OUT / "nasdaq_wayback_provenance.txt").open("a") as fh:
+                    fh.write(f"{name}: {original} snapshot {ts} covering {d0}..{d1} ({n} rows)\n")
+                break
+            log(f"  capture @{ts} spans {d0}..{d1} ({n} rows), not useful")
+
+
+def nasdaq_official_api_probe() -> None:
+    """One shot at api.nasdaq.com for the 2015->today tail (close only)."""
+    if (OUT / "nasdaq_api.json").exists():
+        return
+    url = (
+        "https://api.nasdaq.com/api/quote/COMP/chart?assetclass=index"
+        f"&fromdate=2015-01-01&todate={datetime.date.today().isoformat()}"
+    )
+    try:
+        content = fetch(url, tries=1, timeout=45, extra_headers={
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://www.nasdaq.com",
+            "Referer": "https://www.nasdaq.com/",
+        })
+        points = (json.loads(content).get("data") or {}).get("chart") or []
+        if len(points) > 1000:
+            save("nasdaq_api.json", content)
+        else:
+            log(f"  api.nasdaq.com returned {len(points)} points, ignoring")
+    except Exception as exc:  # noqa: BLE001
+        log(f"  api.nasdaq.com probe failed: {exc}")
 
 
 # ----------------------------------------------------------------- Yahoo
@@ -270,33 +323,42 @@ def main() -> None:
             except Exception as exc:  # noqa: BLE001
                 log(f"WARNING optional source Yahoo {symbol} failed: {exc}")
 
-        have_nasdaq = (OUT / "nasdaq_yahoo.csv").exists()
-
-        if not have_nasdaq and not is_fresh("nasdaq_fred.csv"):
-            try:
-                save("nasdaq_fred.csv", fred_nasdaq())
-                have_nasdaq = True
-            except Exception as exc:  # noqa: BLE001
-                log(f"WARNING FRED direct failed: {exc}")
-        have_nasdaq = have_nasdaq or (OUT / "nasdaq_fred.csv").exists()
-
-        if not have_nasdaq:
-            for name in ("nasdaq_stooq_wayback.csv", "nasdaq_fred_wayback.csv"):
-                if (OUT / name).exists():
-                    have_nasdaq = True
-            if not have_nasdaq:
+        def nasdaq_tail_end():
+            """Latest date across all Nasdaq CSVs on disk (None if none)."""
+            best = None
+            for name in ("nasdaq_yahoo.csv", "nasdaq_fred.csv",
+                         "nasdaq_fred_wayback.csv", "nasdaq_yahoo_wayback.csv",
+                         "nasdaq_stooq_wayback_tail.csv", "nasdaq_stooq_wayback.csv"):
+                path = OUT / name
+                if not path.exists():
+                    continue
                 try:
-                    name, content, ts = wayback_nasdaq()
-                    save(name, content)
-                    (OUT / "nasdaq_wayback_provenance.txt").write_text(
-                        f"{name} downloaded from Internet Archive snapshot {ts}\n"
-                    )
-                    have_nasdaq = True
-                except Exception as exc:  # noqa: BLE001
-                    log(f"WARNING wayback hunt failed: {exc}")
+                    last = path.read_text().strip().splitlines()[-1].split(",")[0]
+                    day = datetime.date.fromisoformat(last.strip())
+                except Exception:  # noqa: BLE001
+                    continue
+                best = day if best is None or day > best else best
+            return best
 
-        if not have_nasdaq:
-            failures.append("no Nasdaq source succeeded (Yahoo, FRED, Wayback)")
+        today = datetime.date.today()
+        end = nasdaq_tail_end()
+        if end is None or (today - end).days > 30:
+            if not (OUT / "nasdaq_fred.csv").exists():
+                try:
+                    save("nasdaq_fred.csv", fred_nasdaq())
+                except Exception as exc:  # noqa: BLE001
+                    log(f"WARNING FRED direct failed: {exc}")
+            end = nasdaq_tail_end()
+            if end is None or (today - end).days > 30:
+                wayback_hunt_nasdaq_tail()
+                nasdaq_official_api_probe()
+
+        end = nasdaq_tail_end()
+        if end is None and not (OUT / "nasdaq_api.json").exists():
+            failures.append("no Nasdaq source succeeded (Yahoo, FRED, Wayback, API)")
+        else:
+            log(f"Nasdaq coverage on disk ends {end}"
+                + (" + api.json tail" if (OUT / 'nasdaq_api.json').exists() else ""))
 
     worker = threading.Thread(target=secondary_sources)
     worker.start()
