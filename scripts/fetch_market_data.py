@@ -154,6 +154,62 @@ def fetch_twse() -> None:
     log(f"--- taiex_twse.csv: {total} data rows written")
 
 
+# ------------------------------------------------------------------ FRED
+def fred_nasdaq() -> bytes:
+    """NASDAQCOM daily closes. The one-shot fredgraph endpoint tar-pits CI
+    runners, so try the static download endpoint first, then fredgraph in
+    four 15-year windows whose smaller responses stream before the timeout."""
+    try:
+        content = fetch(
+            "https://fred.stlouisfed.org/series/NASDAQCOM/downloaddata/NASDAQCOM.csv",
+            tries=2, base_wait=8.0, timeout=120,
+        )
+        first = content[:80].decode("utf-8", "replace").split("\n")[0].lower()
+        if first.startswith(("date", "observation_date")):
+            return content
+        log("  FRED downloaddata returned unexpected payload, falling back")
+    except Exception as exc:  # noqa: BLE001
+        log(f"  FRED downloaddata failed ({exc}), trying chunked fredgraph")
+
+    today = datetime.date.today().isoformat()
+    windows = [
+        ("1971-01-01", "1985-12-31"),
+        ("1986-01-01", "2000-12-31"),
+        ("2001-01-01", "2015-12-31"),
+        ("2016-01-01", today),
+    ]
+    header = None
+    rows: list[str] = []
+    for start, end in windows:
+        url = (
+            "https://fred.stlouisfed.org/graph/fredgraph.csv"
+            f"?id=NASDAQCOM&cosd={start}&coed={end}"
+        )
+        lines = fetch(url, tries=3, base_wait=10.0, timeout=150).decode(
+            "utf-8", "replace").strip().splitlines()
+        if header is None:
+            header = lines[0]
+        rows.extend(lines[1:])
+        log(f"  FRED chunk {start}..{end}: {len(lines) - 1} rows")
+        time.sleep(2)
+    return (header + "\n" + "\n".join(rows) + "\n").encode()
+
+
+# ------------------------------------------------------------------- WSJ
+def wsj_nasdaq() -> bytes:
+    """Nasdaq Composite daily OHLC from WSJ's historical-prices download."""
+    end = datetime.date.today().strftime("%m/%d/%Y")
+    url = (
+        "https://www.wsj.com/market-data/quotes/index/US/COMP/"
+        f"historical-prices/download?MOD=mw_quote&startDate=02/05/1971&endDate={end}"
+    )
+    content = fetch(url, tries=2, base_wait=10.0, timeout=120)
+    first = content[:200].decode("utf-8", "replace").split("\n")[0]
+    if "Date" not in first:
+        raise RuntimeError(f"unexpected WSJ payload: {first[:80]!r}")
+    return content
+
+
 # ----------------------------------------------------------------- Yahoo
 def yahoo_daily_csv(symbol: str) -> bytes:
     url = (
@@ -193,17 +249,15 @@ def main() -> None:
     def secondary_sources() -> None:
         if not is_fresh("nasdaq_fred.csv"):
             try:
-                # FRED serves the full 1971->today series; it can be slow,
-                # so give it a long read timeout and patient retries.
-                save(
-                    "nasdaq_fred.csv",
-                    fetch(
-                        "https://fred.stlouisfed.org/graph/fredgraph.csv?id=NASDAQCOM",
-                        tries=4, base_wait=10.0, timeout=180,
-                    ),
-                )
+                save("nasdaq_fred.csv", fred_nasdaq())
             except Exception as exc:  # noqa: BLE001
                 failures.append(f"FRED NASDAQCOM: {exc}")
+
+        if not is_fresh("nasdaq_wsj.csv"):
+            try:
+                save("nasdaq_wsj.csv", wsj_nasdaq())
+            except Exception as exc:  # noqa: BLE001
+                log(f"WARNING optional source WSJ failed: {exc}")
 
         try:  # warm up the cookie jar; yahoo rate-limits bare API hits harder
             fetch("https://finance.yahoo.com/", tries=1)
