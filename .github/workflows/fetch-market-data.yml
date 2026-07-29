@@ -19,7 +19,7 @@ concurrency:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
 
@@ -27,9 +27,11 @@ jobs:
         run: python3 scripts/fetch_market_data.py
 
       - name: Commit data back to the branch
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data
-          git commit -m "Add TAIEX / Nasdaq daily history fetched from Stooq, Yahoo, FRED" || echo "nothing to commit"
+          [ -d data ] && git add data
+          git commit -m "Add TAIEX / Nasdaq daily history fetched from TWSE, FRED, Yahoo" || echo "nothing to commit"
+          git pull --rebase origin "$GITHUB_REF_NAME" || true
           git push
