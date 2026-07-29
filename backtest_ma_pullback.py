@@ -156,19 +156,26 @@ def run_index(name: str, df: pd.DataFrame) -> dict:
 def main() -> None:
     RESULTS.mkdir(exist_ok=True)
 
-    taiex = load_ohlc(DATA / "taiex_stooq.csv")
-    taiex_y = load_ohlc(DATA / "taiex_yahoo.csv")
-    nasdaq = load_ohlc(DATA / "nasdaq_stooq.csv")
-    nasdaq_y = load_ohlc(DATA / "nasdaq_yahoo.csv")
-    nasdaq_f = load_fred(DATA / "nasdaq_fred.csv")
+    # TAIEX: exchange's official series is the primary; Yahoo cross-checks it.
+    taiex = load_ohlc(DATA / "taiex_twse.csv")
+    validate("TAIEX/twse", taiex)
+    if (DATA / "taiex_yahoo.csv").exists():
+        taiex_y = load_ohlc(DATA / "taiex_yahoo.csv")
+        validate("TAIEX/yahoo", taiex_y)
+        cross_check("TAIEX twse vs yahoo", taiex["Close"], taiex_y["Close"])
 
-    validate("TAIEX/stooq", taiex)
-    validate("TAIEX/yahoo", taiex_y)
-    validate("NASDAQ/stooq", nasdaq)
-    validate("NASDAQ/yahoo", nasdaq_y)
-    cross_check("TAIEX stooq vs yahoo", taiex["Close"], taiex_y["Close"])
-    cross_check("NASDAQ stooq vs yahoo", nasdaq["Close"], nasdaq_y["Close"])
-    cross_check("NASDAQ stooq vs FRED", nasdaq["Close"], nasdaq_f)
+    # Nasdaq: Yahoo OHLC preferred (real intraday lows); FRED close-only
+    # is the cross-check, and the fallback primary if Yahoo failed in CI.
+    nasdaq_f = load_fred(DATA / "nasdaq_fred.csv")
+    if (DATA / "nasdaq_yahoo.csv").exists():
+        nasdaq = load_ohlc(DATA / "nasdaq_yahoo.csv")
+        validate("NASDAQ/yahoo", nasdaq)
+        cross_check("NASDAQ yahoo vs FRED", nasdaq["Close"], nasdaq_f)
+    else:
+        print("NASDAQ falling back to FRED close-only series "
+              "(MA touches will use Close, not intraday Low)")
+        nasdaq = nasdaq_f.to_frame("Close")
+        validate("NASDAQ/fred", nasdaq)
 
     all_results = {}
     for name, df in [("台灣加權指數 TAIEX", taiex), ("那斯達克綜合指數 IXIC", nasdaq)]:

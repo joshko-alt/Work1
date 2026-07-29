@@ -10,15 +10,20 @@ Sources:
 - FRED NASDAQCOM                              -> nasdaq_fred.csv  close, primary
 - Yahoo Finance ^TWII / ^IXIC (best effort)   -> *_yahoo.csv      OHLC, cross-check
 
+The TWSE monthly loop is throttled to one request per ~3.2s per their
+rate-limit guidance and takes ~20 minutes for 1999->today, so FRED and
+Yahoo run in a background thread alongside it. The TWSE CSV is written
+incrementally so a partial run still leaves usable data behind.
+
 Exit code is non-zero if either primary source failed; Yahoo failures
-only produce a warning. Politeness: TWSE is throttled to one request
-per ~3.5s per their rate-limit guidance.
+only produce a warning.
 """
 import datetime
 import http.cookiejar
 import json
 import pathlib
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -36,32 +41,56 @@ HEADERS = {
 
 _jar = http.cookiejar.CookieJar()
 _opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_jar))
+_print_lock = threading.Lock()
 
 
-def fetch(url: str, tries: int = 4, base_wait: float = 5.0) -> bytes:
+def log(*args) -> None:
+    with _print_lock:
+        print(*args, flush=True)
+
+
+def fetch(url: str, tries: int = 3, base_wait: float = 6.0, timeout: int = 45) -> bytes:
     last = None
     for i in range(tries):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
-            with _opener.open(req, timeout=90) as resp:
+            with _opener.open(req, timeout=timeout) as resp:
                 return resp.read()
         except Exception as exc:  # noqa: BLE001 - retry on any transport error
             last = exc
-            wait = base_wait * (2 ** i)
-            print(f"  retry {i + 1} for {url.split('?')[0]} in {wait:.0f}s ({exc})")
-            time.sleep(wait)
+            if i < tries - 1:
+                wait = base_wait * (2 ** i)
+                log(f"  retry {i + 1} for {url.split('?')[0]} in {wait:.0f}s ({exc})")
+                time.sleep(wait)
     raise RuntimeError(f"failed to fetch {url}: {last}")
+
+
+def is_fresh(name: str, max_age_days: int = 5) -> bool:
+    """True if the CSV already exists and its last row is recent enough."""
+    path = OUT / name
+    if not path.exists():
+        return False
+    try:
+        last_date = path.read_text().strip().splitlines()[-1].split(",")[0]
+        day = datetime.date.fromisoformat(last_date)
+    except Exception:  # noqa: BLE001 - malformed file -> refetch
+        return False
+    age = (datetime.date.today() - day).days
+    if age <= max_age_days:
+        log(f"--- {name}: already fresh (last row {day}), skipping fetch")
+        return True
+    return False
 
 
 def save(name: str, content: bytes) -> None:
     path = OUT / name
     path.write_bytes(content)
     lines = content.decode("utf-8", "replace").strip().splitlines()
-    print(f"--- {name}: {len(lines)} lines")
+    log(f"--- {name}: {len(lines)} lines")
     for line in lines[:2]:
-        print("  head:", line[:120])
+        log("  head: " + line[:120])
     for line in lines[-1:]:
-        print("  tail:", line[:120])
+        log("  tail: " + line[:120])
 
 
 # ------------------------------------------------------------------ TWSE
@@ -102,38 +131,37 @@ def fetch_twse() -> None:
         months.append(f"{y:04d}{m:02d}01")
         y, m = (y + 1, 1) if m == 12 else (y, m + 1)
 
-    all_rows: list[list[str]] = []
+    path = OUT / "taiex_twse.csv"
+    total = 0
     missing: list[str] = []
     started = False
-    for i, month in enumerate(months):
-        rows = twse_month(month)
-        if rows:
-            started = True
-            all_rows.extend(rows)
-        elif started:
-            missing.append(month)
-        if i % 24 == 0 or rows == []:
-            print(f"  TWSE {month}: {len(rows)} rows (total {len(all_rows)})")
-        time.sleep(3.5)
+    with path.open("w") as fh:
+        fh.write("Date,Open,High,Low,Close\n")
+        for i, month in enumerate(months):
+            rows = twse_month(month)
+            if rows:
+                started = True
+                total += len(rows)
+                fh.write("\n".join(",".join(r) for r in rows) + "\n")
+                fh.flush()
+            elif started:
+                missing.append(month)
+            log(f"  TWSE {month}: {len(rows):2d} rows (total {total})")
+            time.sleep(3.2)
 
     if missing:
-        print(f"  TWSE WARNING missing months after series start: {missing}")
-    csv = "Date,Open,High,Low,Close\n" + "\n".join(",".join(r) for r in all_rows) + "\n"
-    save("taiex_twse.csv", csv.encode())
+        log(f"  TWSE WARNING missing months after series start: {missing}")
+    log(f"--- taiex_twse.csv: {total} data rows written")
 
 
 # ----------------------------------------------------------------- Yahoo
 def yahoo_daily_csv(symbol: str) -> bytes:
-    try:  # warm up the cookie jar; yahoo rate-limits bare API hits harder
-        fetch("https://finance.yahoo.com/", tries=1)
-    except Exception:  # noqa: BLE001
-        pass
     url = (
         "https://query2.finance.yahoo.com/v8/finance/chart/"
         f"{urllib.parse.quote(symbol)}"
         "?period1=0&period2=9999999999&interval=1d"
     )
-    payload = json.loads(fetch(url, tries=5, base_wait=15.0))
+    payload = json.loads(fetch(url, tries=3, base_wait=12.0))
     result = payload["chart"]["result"][0]
     timestamps = result["timestamp"]
     quote = result["indicators"]["quote"][0]
@@ -160,33 +188,52 @@ def yahoo_daily_csv(symbol: str) -> bytes:
 
 
 def main() -> None:
-    failures = []
+    failures: list[str] = []
 
-    try:
-        save(
-            "nasdaq_fred.csv",
-            fetch("https://fred.stlouisfed.org/graph/fredgraph.csv?id=NASDAQCOM"),
-        )
-    except Exception as exc:  # noqa: BLE001
-        failures.append(f"FRED NASDAQCOM: {exc}")
+    def secondary_sources() -> None:
+        if not is_fresh("nasdaq_fred.csv"):
+            try:
+                # FRED serves the full 1971->today series; it can be slow,
+                # so give it a long read timeout and patient retries.
+                save(
+                    "nasdaq_fred.csv",
+                    fetch(
+                        "https://fred.stlouisfed.org/graph/fredgraph.csv?id=NASDAQCOM",
+                        tries=4, base_wait=10.0, timeout=180,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                failures.append(f"FRED NASDAQCOM: {exc}")
 
-    for symbol, name in [("^TWII", "taiex_yahoo.csv"), ("^IXIC", "nasdaq_yahoo.csv")]:
+        try:  # warm up the cookie jar; yahoo rate-limits bare API hits harder
+            fetch("https://finance.yahoo.com/", tries=1)
+        except Exception:  # noqa: BLE001
+            pass
+        for symbol, name in [("^TWII", "taiex_yahoo.csv"), ("^IXIC", "nasdaq_yahoo.csv")]:
+            if is_fresh(name):
+                continue
+            try:
+                save(name, yahoo_daily_csv(symbol))
+            except Exception as exc:  # noqa: BLE001
+                log(f"WARNING optional source Yahoo {symbol} failed: {exc}")
+
+    worker = threading.Thread(target=secondary_sources)
+    worker.start()
+
+    if not is_fresh("taiex_twse.csv"):
         try:
-            save(name, yahoo_daily_csv(symbol))
+            fetch_twse()
         except Exception as exc:  # noqa: BLE001
-            print(f"WARNING optional source Yahoo {symbol} failed: {exc}")
+            failures.append(f"TWSE: {exc}")
 
-    try:
-        fetch_twse()
-    except Exception as exc:  # noqa: BLE001
-        failures.append(f"TWSE: {exc}")
+    worker.join()
 
     if failures:
-        print("PRIMARY SOURCE FAILURES:")
+        log("PRIMARY SOURCE FAILURES:")
         for f in failures:
-            print(" -", f)
+            log(" - " + f)
         sys.exit(1)
-    print("primary sources fetched")
+    log("primary sources fetched")
 
 
 if __name__ == "__main__":
