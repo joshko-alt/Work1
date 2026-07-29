@@ -1,12 +1,8 @@
 name: Fetch market data
 
+# Manual-only: the dataset under data/ is committed; re-run this workflow
+# from the Actions tab only when the series need to be refreshed.
 on:
-  push:
-    branches:
-      - claude/taiwan-nasdaq-backtest-bpor5s
-    paths:
-      - .github/workflows/fetch-market-data.yml
-      - scripts/fetch_market_data.py
   workflow_dispatch:
 
 permissions:

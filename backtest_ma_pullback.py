@@ -23,6 +23,7 @@ Data: raw CSVs under data/ fetched by scripts/fetch_market_data.py
 """
 from __future__ import annotations
 
+import json
 import pathlib
 
 import numpy as np
@@ -69,13 +70,51 @@ NASDAQ_SOURCES = [
     ("nasdaq_fred.csv", "FRED NASDAQCOM（日收盤）", "fred"),
     ("nasdaq_fred_wayback.csv",
      "FRED NASDAQCOM（Internet Archive 快照，日收盤）", "fred"),
+    ("nasdaq_api.json", "那斯達克官方 api.nasdaq.com COMP（日收盤）", "api"),
 ]
+
+NASDAQ_INCEPTION = "1971-02-05"  # composite base date; earlier rows in the
+                                 # archived Stooq file are a predecessor index
+
+
+def load_nasdaq_api(path: pathlib.Path) -> pd.DataFrame:
+    """Close-only frame from an api.nasdaq.com chart payload."""
+    chart = json.loads(path.read_text())["data"]["chart"]
+    rows = []
+    for pt in chart:
+        m, d, y = pt["z"]["dateTime"].split("/")
+        rows.append((f"{int(y):04d}-{int(m):02d}-{int(d):02d}", float(pt["y"])))
+    df = pd.DataFrame(rows, columns=["Date", "Close"])
+    df["Date"] = pd.to_datetime(df["Date"])
+    return df.drop_duplicates("Date").set_index("Date").sort_index()
 
 
 def _load_nasdaq_file(name: str, kind: str) -> pd.DataFrame:
     if kind == "ohlc":
         return load_ohlc(DATA / name)
+    if kind == "api":
+        return load_nasdaq_api(DATA / name)
     return load_fred(DATA / name).to_frame("Close")
+
+
+def repair_bad_prints(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    """Fix single-day spike-and-revert bad prints (e.g. the archived Stooq
+    series shows -13.5%/+16.2% on 1972-04-13/14; no such move happened).
+    A day is repaired only when the move exceeds 12%, reverses the next
+    day, and the two-day round trip nets out to under 3%."""
+    close = df["Close"]
+    ret = close.pct_change()
+    round_trip = close.shift(-1) / close.shift(1) - 1
+    bad = (ret.abs() > 0.12) & (ret.shift(-1).abs() > 0.12) & \
+          (np.sign(ret) != np.sign(ret.shift(-1))) & (round_trip.abs() < 0.03)
+    for ts in df.index[bad.fillna(False)]:
+        i = df.index.get_loc(ts)
+        patched = (close.iloc[i - 1] + close.iloc[i + 1]) / 2
+        print(f"[{name}] repaired bad print {ts.date()}: "
+              f"{close.iloc[i]:.2f} -> {patched:.2f}")
+        for col in df.columns:
+            df.loc[ts, col] = patched
+    return df
 
 
 def splice(base: pd.DataFrame, tail: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
@@ -108,7 +147,7 @@ def load_nasdaq() -> tuple[pd.DataFrame, str]:
     # A single file that starts by 1972 and reaches the latest end wins.
     for df, desc, kind in available:
         if df.index.min().year <= 1972 and df.index.max() >= latest_end - pd.Timedelta(days=7):
-            return df, desc
+            return _finalize_nasdaq(df), desc
 
     # Otherwise splice: longest history as base (prefer OHLC), then keep
     # extending with whichever remaining series reaches furthest.
@@ -123,7 +162,12 @@ def load_nasdaq() -> tuple[pd.DataFrame, str]:
         print(f"[splice] + {d_desc} after {switch}: "
               f"overlap median rel diff {diff.median():.2e}")
         desc += f"，{switch} 之後接 {d_desc}"
-    return base, desc
+    return _finalize_nasdaq(base), desc
+
+
+def _finalize_nasdaq(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.loc[NASDAQ_INCEPTION:].copy()
+    return repair_bad_prints(df, "NASDAQ")
 
 
 def validate(name: str, df: pd.DataFrame) -> None:
@@ -242,10 +286,9 @@ def main() -> None:
     if "Low" not in nasdaq.columns:
         print("NASDAQ series is close-only: MA touches use Close, not intraday Low")
     for name, desc, kind in NASDAQ_SOURCES:
-        if desc == nasdaq_src or not (DATA / name).exists():
+        if desc in nasdaq_src or not (DATA / name).exists():
             continue
-        other = (load_ohlc(DATA / name)["Close"] if kind == "ohlc"
-                 else load_fred(DATA / name))
+        other = _load_nasdaq_file(name, kind)["Close"]
         cross_check(f"NASDAQ vs {name}", nasdaq["Close"], other)
 
     all_results = {}

@@ -1,0 +1,567 @@
+<title>均線回檔回測：台灣加權 vs 那斯達克</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7;
+    --surface: #fcfcfb;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --border: rgba(11, 11, 11, 0.10);
+    --accent: #2a78d6;
+    --s1: #2a78d6;   /* 季線 */
+    --s2: #eb6834;   /* 半年線 */
+    --s3: #1baf7a;   /* 年線 */
+    --base-key: #898781; /* 基準參考線 */
+    --good: #006300;
+    --bad: #d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page: #0d0d0d;
+      --surface: #1a1a19;
+      --ink: #ffffff;
+      --ink-2: #c3c2b7;
+      --muted: #898781;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --border: rgba(255, 255, 255, 0.10);
+      --accent: #3987e5;
+      --s1: #3987e5;
+      --s2: #d95926;
+      --s3: #199e70;
+      --good: #0ca30c;
+      --bad: #e66767;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --accent: #3987e5;
+    --s1: #3987e5;
+    --s2: #d95926;
+    --s3: #199e70;
+    --good: #0ca30c;
+    --bad: #e66767;
+  }
+
+  body {
+    background: var(--page);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", "PingFang TC",
+      "Microsoft JhengHei", "Noto Sans TC", sans-serif;
+    line-height: 1.65;
+    margin: 0;
+  }
+  .page {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 48px 24px 80px;
+  }
+  .eyebrow {
+    font-size: 12px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+    margin: 0 0 12px;
+  }
+  h1 {
+    font-size: clamp(26px, 4.5vw, 36px);
+    line-height: 1.25;
+    margin: 0 0 10px;
+    text-wrap: balance;
+    font-weight: 700;
+  }
+  .lede {
+    color: var(--ink-2);
+    max-width: 62ch;
+    margin: 0 0 8px;
+  }
+  .meta {
+    color: var(--muted);
+    font-size: 13px;
+    margin: 0 0 36px;
+  }
+  h2 {
+    font-size: 20px;
+    margin: 44px 0 12px;
+    padding-top: 20px;
+    border-top: 1px solid var(--grid);
+    text-wrap: balance;
+  }
+  h3 { font-size: 16px; margin: 26px 0 8px; }
+  p, li { max-width: 68ch; }
+  .method { color: var(--ink-2); font-size: 14.5px; padding-left: 1.2em; }
+  .method li { margin-bottom: 4px; }
+  .method strong { color: var(--ink); }
+
+  .tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 14px;
+    margin: 24px 0 8px;
+  }
+  .tile {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+  }
+  .tile .label { font-size: 13px; color: var(--ink-2); margin: 0 0 6px; }
+  .tile .value { font-size: 34px; font-weight: 600; line-height: 1.1; }
+  .tile .sub { font-size: 13px; color: var(--muted); margin-top: 6px; }
+  .pos { color: var(--good); }
+  .neg { color: var(--bad); }
+
+  figure.chart {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin: 18px 0 8px;
+    padding: 18px 18px 10px;
+    position: relative;
+  }
+  figure.chart figcaption {
+    font-size: 13px;
+    color: var(--muted);
+    padding: 6px 2px 8px;
+  }
+  .chart-title { font-size: 15px; font-weight: 600; margin: 0 0 2px; }
+  .chart-sub { font-size: 13px; color: var(--muted); margin: 0 0 10px; }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    font-size: 13px;
+    color: var(--ink-2);
+    padding: 2px 2px 10px;
+  }
+  .legend .key { display: inline-flex; align-items: center; gap: 6px; }
+  .legend .swatch {
+    width: 12px; height: 12px; border-radius: 3px; display: inline-block;
+  }
+  .legend .linekey {
+    width: 16px; height: 0; border-top: 2px dashed var(--base-key);
+    display: inline-block;
+  }
+  svg .bar { transition: filter 0.1s ease; }
+  svg .grp:hover .bar, svg .grp:focus .bar { filter: brightness(1.08); }
+  svg .grp { outline: none; }
+  svg .grp:focus-visible .hit { stroke: var(--accent); stroke-width: 1.5; }
+  svg .s0 { fill: var(--s1); }
+  svg .s1 { fill: var(--s2); }
+  svg .s2 { fill: var(--s3); }
+  svg .gl { stroke: var(--grid); stroke-width: 1; }
+  svg .zl { stroke: var(--axis); stroke-width: 1; }
+  svg .bl { stroke: var(--base-key); stroke-width: 2; stroke-dasharray: 5 3; }
+  svg .tick { fill: var(--muted); font-variant-numeric: tabular-nums; }
+  svg .xlab { fill: var(--ink-2); }
+  svg .dlabel { fill: var(--ink); font-variant-numeric: tabular-nums; }
+
+  .tooltip {
+    position: absolute;
+    pointer-events: none;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.14);
+    border-radius: 8px;
+    padding: 9px 12px;
+    font-size: 12.5px;
+    min-width: 150px;
+    opacity: 0;
+    transition: opacity 0.08s ease;
+    z-index: 5;
+  }
+  .tooltip.on { opacity: 1; }
+  .tooltip .t-h { color: var(--muted); margin-bottom: 5px; }
+  .tooltip .t-row {
+    display: flex; align-items: center; gap: 7px;
+    justify-content: space-between; margin: 2px 0;
+  }
+  .tooltip .t-left { display: inline-flex; align-items: center; gap: 7px; color: var(--ink-2); }
+  .tooltip .t-key { width: 12px; height: 0; border-top: 3px solid; display: inline-block; border-radius: 2px; }
+  .tooltip .t-val { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  .tablewrap { overflow-x: auto; margin: 14px 0 6px; }
+  table.stats {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 13.5px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  table.stats th, table.stats td {
+    padding: 7px 12px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    border-bottom: 1px solid var(--grid);
+    white-space: nowrap;
+  }
+  table.stats th { color: var(--ink-2); font-weight: 600; }
+  table.stats td:first-child, table.stats th:first-child { text-align: left; }
+  table.stats tr.grouphead td {
+    text-align: left;
+    font-weight: 600;
+    color: var(--ink);
+    background: color-mix(in srgb, var(--surface) 92%, var(--ink) 8%);
+    border-top: 1px solid var(--axis);
+  }
+  table.stats tr.grouphead .dot {
+    display: inline-block; width: 10px; height: 10px;
+    border-radius: 3px; margin-right: 7px; vertical-align: baseline;
+  }
+  table.stats tr:last-child td { border-bottom: none; }
+
+  .note { font-size: 13.5px; color: var(--ink-2); }
+  .footer {
+    margin-top: 48px; padding-top: 16px;
+    border-top: 1px solid var(--grid);
+    color: var(--muted); font-size: 12.5px;
+  }
+  a { color: var(--accent); }
+</style>
+
+<div class="page">
+  <p class="eyebrow">量化回測筆記</p>
+  <h1>回檔碰到季線、半年線、年線時買進，之後表現如何？</h1>
+  <p class="lede">以台灣加權股價指數與美國那斯達克綜合指數的日線資料回測：當指數在均線上方運行至少一個月後，回檔首次觸及該均線（盤中最低點碰到），於當日收盤買進，統計其後 3 個月、6 個月、1 年、2 年、3 年的平均績效，並與「任選一天買進」的基準比較。</p>
+  <p class="meta" id="meta"></p>
+
+  <div class="tiles" id="tiles"></div>
+
+  <h2>訊號定義與方法</h2>
+  <ul class="method">
+    <li><strong>均線</strong>：季線＝60 個交易日、半年線＝120 個交易日、年線＝240 個交易日之收盤價簡單移動平均。</li>
+    <li><strong>回檔觸線</strong>：先前連續 20 個交易日整根 K 棒（含最低價）都在均線上方，當日最低價首次觸及或跌破均線，即為一次訊號；之後需再次站上均線滿 20 個交易日才會重新武裝。</li>
+    <li><strong>進場</strong>：訊號當日收盤價買進；報酬為收盤對收盤，不含股息與交易成本。</li>
+    <li><strong>期間對應</strong>：3 個月＝63、6 個月＝126、1 年＝252、2 年＝504、3 年＝756 個交易日。</li>
+    <li><strong>基準</strong>：同一樣本期間內任選一個交易日買進的平均前瞻報酬（所有交易日的平均）。</li>
+  </ul>
+
+  <div id="sections"></div>
+
+  <h2>資料來源與交叉驗證</h2>
+  <ul class="method" id="sources"></ul>
+
+  <h2>解讀時的注意事項</h2>
+  <ul class="method">
+    <li>樣本之間有<strong>時間重疊</strong>（例如相鄰兩次訊號的 3 年視窗高度重疊），實際獨立樣本數低於名目樣本數，統計顯著性有限。</li>
+    <li>兩者皆為<strong>價格指數</strong>，未含股息再投資；台股現金殖利率長期較高，實際總報酬會更好。</li>
+    <li>接近資料尾端的訊號沒有完整的長天期視窗，長天期樣本數因此較少。</li>
+    <li>「觸線買進」不等於「觸線後止跌」——部分訊號隨後跌破均線進入深度回檔，平均數字已包含這些失敗案例；最差值一欄顯示尾部風險。</li>
+    <li>歷史統計不代表未來表現，本頁僅供研究參考，非投資建議。</li>
+  </ul>
+
+  <div class="footer" id="foot"></div>
+</div>
+
+<div class="tooltip" id="tt" role="status" aria-hidden="true"></div>
+
+<script>
+"use strict";
+const DATA = /*__DATA__*/null;
+
+const SERIES_VARS = ["--s1", "--s2", "--s3"];
+const pct = (x, digits = 1) =>
+  (x >= 0 ? "+" : "") + (100 * x).toFixed(digits) + "%";
+const pct0 = (x) => (100 * x).toFixed(0) + "%";
+
+function el(tag, attrs = {}, text) {
+  const ns = "http://www.w3.org/2000/svg";
+  const svgTags = new Set(["svg", "g", "rect", "path", "line", "text", "title"]);
+  const node = svgTags.has(tag)
+    ? document.createElementNS(ns, tag)
+    : document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+/* ---------- meta ---------- */
+document.getElementById("meta").textContent =
+  "資料截至 " + DATA.asof + "・訊號為「均線上方運行 20 日後首次觸線」・報酬未含股息";
+
+/* ---------- headline tiles ---------- */
+const tiles = document.getElementById("tiles");
+for (const t of DATA.tiles) {
+  const d = el("div", { class: "tile" });
+  d.appendChild(el("p", { class: "label" }, t.label));
+  const v = el("div", { class: "value " + (t.value >= 0 ? "pos" : "neg") });
+  v.textContent = pct(t.value);
+  d.appendChild(v);
+  d.appendChild(el("div", { class: "sub" }, t.sub));
+  tiles.appendChild(d);
+}
+
+/* ---------- per-index sections ---------- */
+const tt = document.getElementById("tt");
+const sections = document.getElementById("sections");
+
+function showTip(fig, evt, html) {
+  tt.replaceChildren(...html);
+  tt.classList.add("on");
+  tt.setAttribute("aria-hidden", "false");
+  const pageW = document.documentElement.clientWidth;
+  let x = evt.clientX + 14, y = evt.clientY + 14;
+  const w = tt.offsetWidth || 170, h = tt.offsetHeight || 90;
+  if (x + w > pageW - 8) x = evt.clientX - w - 10;
+  if (y + h > window.innerHeight - 8) y = evt.clientY - h - 10;
+  tt.style.left = x + window.scrollX + "px";
+  tt.style.top = y + window.scrollY + "px";
+}
+function tipRows(title, entries) {
+  const frag = [el("div", { class: "t-h" }, title)];
+  for (const e of entries) {
+    const row = el("div", { class: "t-row" });
+    const left = el("span", { class: "t-left" });
+    const key = el("span", { class: "t-key" });
+    key.style.borderTopColor = e.color;
+    if (e.dashed) { key.style.borderTopStyle = "dashed"; key.style.borderTopWidth = "2px"; }
+    left.appendChild(key);
+    left.appendChild(document.createTextNode(e.name));
+    row.appendChild(left);
+    row.appendChild(el("span", { class: "t-val" }, pct(e.value)));
+    frag.push(row);
+  }
+  return frag;
+}
+function hideTip() {
+  tt.classList.remove("on");
+  tt.setAttribute("aria-hidden", "true");
+}
+
+function drawChart(fig, index) {
+  const horizons = DATA.horizons;
+  const W = 820, plotH = 240, padL = 52, padR = 14, padT = 14, axisBand = 26;
+  const H = plotH + padT + axisBand;
+  const svg = el("svg", {
+    viewBox: `0 0 ${W} ${H}`,
+    width: "100%",
+    role: "img",
+    "aria-label": index.name + " 各均線觸及後平均報酬圖",
+  });
+
+  const means = [];
+  index.mas.forEach((m) => m.rows.forEach((r) => { if (r.n > 0) means.push(r.mean); }));
+  index.baseline.rows.forEach((r) => means.push(r.mean));
+  let lo = Math.min(0, ...means), hi = Math.max(0, ...means);
+  const span = hi - lo || 1;
+  lo -= span * 0.08; hi += span * 0.12;
+
+  const y = (v) => padT + (hi - v) / (hi - lo) * plotH;
+  const groupW = (W - padL - padR) / horizons.length;
+
+  // gridlines + y ticks (clean % steps)
+  const step = niceStep((hi - lo));
+  for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) {
+    const yy = y(v);
+    svg.appendChild(el("line", {
+      class: "gl", x1: padL, x2: W - padR, y1: yy.toFixed(1), y2: yy.toFixed(1),
+    }));
+    svg.appendChild(el("text", {
+      class: "tick", x: padL - 8, y: (yy + 4).toFixed(1),
+      "text-anchor": "end", "font-size": 11,
+    }, Math.round(v * 100) + "%"));
+  }
+  // zero baseline
+  svg.appendChild(el("line", {
+    class: "zl", x1: padL, x2: W - padR, y1: y(0).toFixed(1), y2: y(0).toFixed(1),
+  }));
+
+  const barMax = 24, gap = 2;
+  const nSeries = index.mas.length;
+  const barW = Math.min(barMax, (groupW * 0.62 - gap * (nSeries - 1)) / nSeries);
+  const groupInnerW = barW * nSeries + gap * (nSeries - 1);
+
+  // find the extreme bar (largest |mean|) for the selective direct label
+  let extreme = null;
+  index.mas.forEach((m, si) => m.rows.forEach((r, hi2) => {
+    if (r.n > 0 && (!extreme || Math.abs(r.mean) > Math.abs(extreme.mean)))
+      extreme = { si, hi: hi2, mean: r.mean };
+  }));
+
+  horizons.forEach((hLabel, gi) => {
+    const gx = padL + gi * groupW + (groupW - groupInnerW) / 2;
+    const grp = el("g", { class: "grp", tabindex: "0", role: "group" });
+    grp.appendChild(el("title", {}, hLabel));
+
+    // invisible hit area: whole group column
+    const hit = el("rect", {
+      class: "hit",
+      x: (padL + gi * groupW + 2).toFixed(1), y: padT,
+      width: (groupW - 4).toFixed(1), height: plotH + axisBand - 4,
+      fill: "transparent", stroke: "none", rx: 6,
+    });
+    grp.appendChild(hit);
+
+    index.mas.forEach((m, si) => {
+      const r = m.rows[gi];
+      if (!r || r.n === 0) return;
+      const x0 = gx + si * (barW + gap);
+      const y0 = y(Math.max(0, r.mean)), y1 = y(Math.min(0, r.mean));
+      const h = Math.max(1, y1 - y0);
+      const rr = Math.min(4, h, barW / 2);
+      const up = r.mean >= 0;
+      const d = up
+        ? `M${x0},${y0 + h}V${y0 + rr}Q${x0},${y0} ${x0 + rr},${y0}H${x0 + barW - rr}Q${x0 + barW},${y0} ${x0 + barW},${y0 + rr}V${y0 + h}Z`
+        : `M${x0},${y0}V${y0 + h - rr}Q${x0},${y0 + h} ${x0 + rr},${y0 + h}H${x0 + barW - rr}Q${x0 + barW},${y0 + h} ${x0 + barW},${y0 + h - rr}V${y0}Z`;
+      grp.appendChild(el("path", { d, class: "bar s" + si }));
+
+      if (extreme && extreme.si === si && extreme.hi === gi) {
+        svg.appendChild(el("text", {
+          class: "dlabel",
+          x: (x0 + barW / 2).toFixed(1),
+          y: (up ? y0 - 6 : y1 + 14).toFixed(1),
+          "text-anchor": "middle", "font-size": 11.5, "font-weight": 600,
+        }, pct(extreme.mean)));
+      }
+    });
+
+    // baseline dash across the group
+    const bl = index.baseline.rows[gi];
+    if (bl) {
+      svg.appendChild(el("line", {
+        class: "bl",
+        x1: (gx - 6).toFixed(1), x2: (gx + groupInnerW + 6).toFixed(1),
+        y1: y(bl.mean).toFixed(1), y2: y(bl.mean).toFixed(1),
+      }));
+    }
+
+    // x label
+    svg.appendChild(el("text", {
+      class: "xlab",
+      x: (padL + gi * groupW + groupW / 2).toFixed(1),
+      y: (padT + plotH + 18).toFixed(1),
+      "text-anchor": "middle", "font-size": 12,
+    }, hLabel));
+
+    const entries = () => {
+      const es = index.mas
+        .map((m, si) => ({
+          name: m.label + "（n=" + m.rows[gi].n + "）",
+          value: m.rows[gi].mean,
+          color: "var(" + SERIES_VARS[si] + ")",
+          n: m.rows[gi].n,
+        }))
+        .filter((e) => e.n > 0);
+      if (bl) es.push({ name: "任一日買進", value: bl.mean, color: "var(--base-key)", dashed: true });
+      return es;
+    };
+    grp.addEventListener("pointermove", (evt) => showTip(fig, evt, tipRows(index.short + "・" + hLabel + " 平均報酬", entries())));
+    grp.addEventListener("pointerleave", hideTip);
+    grp.addEventListener("focus", () => {
+      const box = grp.getBoundingClientRect();
+      showTip(fig, { clientX: box.left + box.width / 2, clientY: box.top + 30 }, tipRows(index.short + "・" + hLabel + " 平均報酬", entries()));
+    });
+    grp.addEventListener("blur", hideTip);
+    svg.appendChild(grp);
+  });
+
+  return svg;
+}
+
+function niceStep(range) {
+  const raw = range / 5;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (raw <= m * mag) return m * mag;
+  return 10 * mag;
+}
+
+function statsTable(index) {
+  const wrap = el("div", { class: "tablewrap" });
+  const table = el("table", { class: "stats" });
+  const thead = el("thead");
+  const hr = el("tr");
+  ["期間", "樣本數", "平均報酬", "中位數", "勝率", "最差", "最好"].forEach((h) =>
+    hr.appendChild(el("th", { scope: "col" }, h)));
+  thead.appendChild(hr);
+  table.appendChild(thead);
+  const tbody = el("tbody");
+
+  const groups = index.mas.map((m, si) => ({
+    label: "回檔觸及" + m.label + "（共 " + m.signals + " 次訊號）",
+    color: "var(" + SERIES_VARS[si] + ")", rows: m.rows,
+  }));
+  groups.push({ label: "基準：任一日買進", color: "var(--base-key)", rows: index.baseline.rows });
+
+  for (const g of groups) {
+    const gh = el("tr", { class: "grouphead" });
+    const td = el("td", { colspan: "7" });
+    const dot = el("span", { class: "dot" });
+    dot.style.background = g.color;
+    td.appendChild(dot);
+    td.appendChild(document.createTextNode(g.label));
+    gh.appendChild(td);
+    tbody.appendChild(gh);
+    g.rows.forEach((r, i) => {
+      const tr = el("tr");
+      tr.appendChild(el("td", {}, DATA.horizons[i]));
+      tr.appendChild(el("td", {}, String(r.n)));
+      const mean = el("td", {}, r.n ? pct(r.mean) : "—");
+      if (r.n) mean.className = r.mean >= 0 ? "pos" : "neg";
+      tr.appendChild(mean);
+      tr.appendChild(el("td", {}, r.n ? pct(r.med) : "—"));
+      tr.appendChild(el("td", {}, r.n ? pct0(r.win) : "—"));
+      tr.appendChild(el("td", {}, r.n ? pct(r.min) : "—"));
+      tr.appendChild(el("td", {}, r.n ? pct(r.max) : "—"));
+      tbody.appendChild(tr);
+    });
+  }
+  table.appendChild(tbody);
+  wrap.appendChild(table);
+  return wrap;
+}
+
+for (const index of DATA.indices) {
+  const h2 = el("h2", {}, index.name);
+  sections.appendChild(h2);
+  const intro = el("p", { class: "note" }, index.intro);
+  sections.appendChild(intro);
+
+  const fig = el("figure", { class: "chart" });
+  fig.appendChild(el("p", { class: "chart-title" }, "各均線觸及後的平均累積報酬"));
+  fig.appendChild(el("p", { class: "chart-sub" },
+    "長條＝該均線訊號的平均報酬；灰色虛線＝同期任一日買進的基準。完整統計見下表。"));
+  const legend = el("div", { class: "legend", role: "list" });
+  index.mas.forEach((m, si) => {
+    const k = el("span", { class: "key", role: "listitem" });
+    const sw = el("span", { class: "swatch" });
+    sw.style.background = "var(" + SERIES_VARS[si] + ")";
+    k.appendChild(sw);
+    k.appendChild(document.createTextNode(m.label));
+    legend.appendChild(k);
+  });
+  const bk = el("span", { class: "key", role: "listitem" });
+  bk.appendChild(el("span", { class: "linekey" }));
+  bk.appendChild(document.createTextNode("任一日買進（基準）"));
+  legend.appendChild(bk);
+  fig.appendChild(legend);
+  fig.appendChild(drawChart(fig, index));
+  fig.appendChild(el("figcaption", {}, index.caption));
+  sections.appendChild(fig);
+
+  sections.appendChild(statsTable(index));
+}
+
+/* ---------- sources ---------- */
+const src = document.getElementById("sources");
+for (const s of DATA.sources) {
+  const li = el("li");
+  li.appendChild(document.createTextNode(s));
+  src.appendChild(li);
+}
+document.getElementById("foot").textContent = DATA.footer;
+</script>
